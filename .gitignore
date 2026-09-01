@@ -1,4 +1,5 @@
 # Secrets — keep local only
+.github_token
 ansible/falcon_token.ini
 ansible/ssh_remediation/vault.yml
 ansible/vault.yml
