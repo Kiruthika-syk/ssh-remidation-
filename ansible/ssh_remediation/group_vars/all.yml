@@ -1,0 +1,28 @@
+---
+base_dir: "/home/tpx-admin/ansible/ssh_remediation"
+report_dir: "{{ base_dir }}/reports"
+vault_file: "{{ base_dir }}/vault.yml"
+
+vcenters:
+  - blr-vsphere-01.strykercorp.com
+  - stc-vsphere-01.strykercorp.com
+  - fw-vsphere-01.strykercorp.com
+
+linux_guest_patterns:
+  - linux
+  - rhel
+  - red hat
+  - centos
+  - ubuntu
+  - debian
+  - suse
+  - oracle linux
+  - rocky
+  - alma
+
+ssh_probe_timeout: 5
+
+sshd_config_settings:
+  - { key: Port, value: "22" }
+  - { key: PubkeyAuthentication, value: "yes" }
+  - { key: PasswordAuthentication, value: "yes" }

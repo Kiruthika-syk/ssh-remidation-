@@ -1,0 +1,68 @@
+---
+# Look up VM names in vCenter for target IPs from inventory (read-only)
+- name: Lookup VM names for inventory targets
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  collections:
+    - community.vmware
+
+  vars_files:
+    - vault.yml
+
+  vars:
+    target_ips: "{{ groups['ssh_unreachable'] | map('extract', hostvars, 'ansible_host') | list }}"
+    map_file: "{{ report_dir }}/vm_name_map.csv"
+
+  tasks:
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Collect VMs from vCenters
+      community.vmware.vmware_vm_info:
+        hostname: "{{ item }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+      loop: "{{ vcenters }}"
+      register: vcenter_results
+      no_log: true
+      failed_when: false
+
+    - name: Flatten and filter VMs matching target IPs
+      ansible.builtin.set_fact:
+        all_target_vms: "{{ all_target_vms | default([]) + batch }}"
+      vars:
+        batch: >-
+          {{
+            (item.virtual_machines | default([]))
+            | selectattr('ip_address', 'defined')
+            | selectattr('ip_address', 'in', target_ips)
+            | map('combine', {'vcenter': item.item})
+            | list
+          }}
+      loop: "{{ vcenter_results.results }}"
+      when: item.virtual_machines is defined
+
+    - name: Build IP to VM mapping lines
+      ansible.builtin.set_fact:
+        vm_map_lines: "{{ vm_map_lines | default(['IP,VM Name,vCenter,Guest OS']) + [map_line] }}"
+      vars:
+        map_line: "{{ item.ip_address }},{{ item.guest_name | default('N/A') }},{{ item.vcenter }},{{ item.guest_fullname | default('Unknown') }}"
+      loop: "{{ all_target_vms | default([]) }}"
+
+    - name: Write VM name map CSV
+      ansible.builtin.copy:
+        dest: "{{ map_file }}"
+        content: "{{ vm_map_lines | join('\n') }}\n"
+        mode: "0644"
+
+    - name: Show mapping file path
+      ansible.builtin.debug:
+        msg:
+          - "VM map written: {{ map_file }}"
+          - "Matched {{ all_target_vms | default([]) | length }} of {{ target_ips | length }} target IPs"

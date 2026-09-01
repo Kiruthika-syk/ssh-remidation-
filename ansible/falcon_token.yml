@@ -1,0 +1,510 @@
+---
+- name: Install and configure CrowdStrike Falcon Sensor
+  hosts: linux
+  become: true
+  gather_facts: true
+
+  any_errors_fatal: false
+  max_fail_percentage: 100
+
+  vars:
+
+    falcon_cid: "6AD2FE798C9D4A338B586BAA920667C0-F0"
+
+    falcon_provisioning_token: "91241DAE"
+
+    falcon_service_name: "falcon-sensor"
+
+    falconctl_path: "/opt/CrowdStrike/falconctl"
+
+    falcon_work_dir: "/tmp/crowdstrike"
+
+
+  pre_tasks:
+
+    - name: Initialize Falcon deployment status
+      ansible.builtin.set_fact:
+        falcon_status: "NOT_PROCESSED"
+        falcon_install_attempted: false
+        falcon_configuration_attempted: false
+
+
+    - name: Display target information
+      ansible.builtin.debug:
+        msg:
+          - "====================================================="
+          - "CrowdStrike Falcon Deployment"
+          - "====================================================="
+          - "Server       : {{ inventory_hostname }}"
+          - "Hostname     : {{ ansible_facts.hostname }}"
+          - "OS           : {{ ansible_facts.distribution }}"
+          - "OS Version   : {{ ansible_facts.distribution_version }}"
+          - "Architecture : {{ ansible_facts.architecture }}"
+          - "====================================================="
+
+
+    - name: Check supported operating system
+      ansible.builtin.set_fact:
+        falcon_supported_os: >-
+          {{ ansible_facts.os_family in ['RedHat', 'Debian'] }}
+
+
+    - name: Mark unsupported operating system
+      ansible.builtin.set_fact:
+        falcon_status: "UNSUPPORTED_OS"
+      when:
+        - not falcon_supported_os
+
+
+    - name: Check supported architecture
+      ansible.builtin.set_fact:
+        falcon_supported_architecture: >-
+          {{
+            ansible_facts.architecture in
+            ['x86_64', 'aarch64', 'arm64']
+          }}
+      when:
+        - falcon_supported_os
+
+
+    - name: Mark unsupported architecture
+      ansible.builtin.set_fact:
+        falcon_status: "UNSUPPORTED_ARCHITECTURE"
+      when:
+        - falcon_supported_os
+        - not falcon_supported_architecture
+
+
+    - name: Check systemd
+      ansible.builtin.set_fact:
+        falcon_supported_systemd: >-
+          {{ ansible_facts.service_mgr == 'systemd' }}
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+
+
+    - name: Mark unsupported service manager
+      ansible.builtin.set_fact:
+        falcon_status: "UNSUPPORTED_SERVICE_MANAGER"
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+        - not falcon_supported_systemd
+
+
+    - name: Determine RHEL x86_64 package pattern
+      ansible.builtin.set_fact:
+        falcon_package_pattern: >-
+          *el{{ ansible_facts.distribution_major_version }}*.x86_64.rpm
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+        - falcon_supported_systemd
+        - ansible_facts.os_family == "RedHat"
+        - ansible_facts.architecture == "x86_64"
+
+
+    - name: Determine RHEL ARM64 package pattern
+      ansible.builtin.set_fact:
+        falcon_package_pattern: >-
+          *el{{ ansible_facts.distribution_major_version }}*.aarch64.rpm
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+        - falcon_supported_systemd
+        - ansible_facts.os_family == "RedHat"
+        - ansible_facts.architecture in ['aarch64', 'arm64']
+
+
+    - name: Determine Debian x86_64 package pattern
+      ansible.builtin.set_fact:
+        falcon_package_pattern: "*amd64.deb"
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+        - falcon_supported_systemd
+        - ansible_facts.os_family == "Debian"
+        - ansible_facts.architecture == "x86_64"
+
+
+    - name: Determine Debian ARM64 package pattern
+      ansible.builtin.set_fact:
+        falcon_package_pattern: "*arm64.deb"
+      when:
+        - falcon_supported_os
+        - falcon_supported_architecture
+        - falcon_supported_systemd
+        - ansible_facts.os_family == "Debian"
+        - ansible_facts.architecture in ['aarch64', 'arm64']
+
+
+    - name: Find Falcon package on controller
+      ansible.builtin.set_fact:
+        falcon_source_packages: >-
+          {{
+            lookup(
+              'ansible.builtin.fileglob',
+              source_path + '/' + falcon_package_pattern,
+              wantlist=True
+            )
+          }}
+      delegate_to: localhost
+      when:
+        - falcon_package_pattern is defined
+
+
+    - name: Check package availability
+      ansible.builtin.set_fact:
+        falcon_package_available: >-
+          {{
+            falcon_source_packages is defined and
+            falcon_source_packages | length == 1
+          }}
+
+
+    - name: Mark package selection failure
+      ansible.builtin.set_fact:
+        falcon_status: "PACKAGE_NOT_FOUND"
+      when:
+        - falcon_package_pattern is defined
+        - not falcon_package_available
+
+
+  tasks:
+
+    # ========================================================
+    # CHECK EXISTING INSTALLATION
+    # ========================================================
+
+    - name: Check existing falconctl
+      ansible.builtin.stat:
+        path: "{{ falconctl_path }}"
+      register: falconctl_before
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    - name: Record existing Falcon installation
+      ansible.builtin.set_fact:
+        falcon_already_installed: >-
+          {{ falconctl_before.stat.exists | default(false) }}
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    # ========================================================
+    # CREATE TEMP DIRECTORY
+    # ========================================================
+
+    - name: Create Falcon temporary directory
+      ansible.builtin.file:
+        path: "{{ falcon_work_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+
+
+    # ========================================================
+    # COPY PACKAGE
+    # ========================================================
+
+    - name: Copy Falcon package from controller
+      ansible.builtin.copy:
+        src: "{{ falcon_source_packages[0] }}"
+        dest: >-
+          {{ falcon_work_dir }}/{{ falcon_source_packages[0] | basename }}
+        owner: root
+        group: root
+        mode: "0644"
+      register: falcon_copy_result
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+
+
+    - name: Set Falcon package path
+      ansible.builtin.set_fact:
+        falcon_package: >-
+          {{ falcon_work_dir }}/{{ falcon_source_packages[0] | basename }}
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+        - not falcon_copy_result.failed | default(false)
+
+
+    - name: Check package copy result
+      ansible.builtin.set_fact:
+        falcon_status: "PACKAGE_COPY_FAILED"
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+        - falcon_copy_result.failed | default(false)
+
+
+    # ========================================================
+    # INSTALL RPM
+    # ========================================================
+
+    - name: Install Falcon RPM using dnf
+      ansible.builtin.dnf:
+        name: "{{ falcon_package }}"
+        state: present
+        disable_gpg_check: true
+      register: falcon_rpm_install
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+        - ansible_facts.os_family == "RedHat"
+
+
+    # ========================================================
+    # YUM FALLBACK
+    # ========================================================
+
+    - name: Install Falcon RPM using yum fallback
+      ansible.builtin.yum:
+        name: "{{ falcon_package }}"
+        state: present
+        disable_gpg_check: true
+      register: falcon_yum_install
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+        - ansible_facts.os_family == "RedHat"
+        - falcon_rpm_install.failed | default(false)
+
+
+    # ========================================================
+    # INSTALL DEB
+    # ========================================================
+
+    - name: Install Falcon DEB
+      ansible.builtin.apt:
+        deb: "{{ falcon_package }}"
+        state: present
+      register: falcon_deb_install
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_already_installed
+        - ansible_facts.os_family == "Debian"
+
+
+    # ========================================================
+    # CHECK FALCONCTL
+    # ========================================================
+
+    - name: Check falconctl after installation
+      ansible.builtin.stat:
+        path: "{{ falconctl_path }}"
+      register: falconctl_after_install
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    - name: Set Falcon installation state
+      ansible.builtin.set_fact:
+        falcon_install_success: >-
+          {{
+            falconctl_after_install.stat.exists | default(false)
+            and
+            falconctl_after_install.stat.executable | default(false)
+          }}
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    - name: Mark installation failure
+      ansible.builtin.set_fact:
+        falcon_status: "FALCON_INSTALLATION_FAILED"
+      when:
+        - falcon_status == "NOT_PROCESSED"
+        - not falcon_install_success
+
+
+    # ========================================================
+    # CONFIGURE FALCON
+    # ========================================================
+
+    - name: Configure Falcon CID and provisioning token
+      ansible.builtin.command:
+        argv:
+          - "{{ falconctl_path }}"
+          - "-s"
+          - "--cid={{ falcon_cid }}"
+          - "--provisioning-token={{ falcon_provisioning_token }}"
+      register: falcon_configuration
+      changed_when: false
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    - name: Display Falcon configuration command result
+      ansible.builtin.debug:
+        msg:
+          - "====================================================="
+          - "Falcon Configuration Result"
+          - "====================================================="
+          - "Server      : {{ inventory_hostname }}"
+          - "Return Code : {{ falcon_configuration.rc }}"
+          - "STDOUT      : {{ falcon_configuration.stdout | default('') }}"
+          - "STDERR      : {{ falcon_configuration.stderr | default('') }}"
+          - "====================================================="
+      when:
+        - falcon_configuration is defined
+
+
+    # ========================================================
+    # READ CID
+    # ========================================================
+
+    - name: Read configured Falcon CID
+      ansible.builtin.command:
+        argv:
+          - "{{ falconctl_path }}"
+          - "-g"
+          - "--cid"
+      register: falcon_cid_result
+      changed_when: false
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    - name: Determine Falcon CID status
+      ansible.builtin.set_fact:
+        falcon_cid_valid: >-
+          {{
+            falcon_cid_result.rc == 0 and
+            falcon_cid in falcon_cid_result.stdout
+          }}
+      when:
+        - falcon_cid_result is defined
+
+
+    # ========================================================
+    # ENABLE SERVICE
+    # ========================================================
+
+    - name: Enable Falcon Sensor service
+      ansible.builtin.systemd:
+        name: "{{ falcon_service_name }}"
+        enabled: true
+      register: falcon_enable_result
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    # ========================================================
+    # START SERVICE
+    # ========================================================
+
+    - name: Start Falcon Sensor service
+      ansible.builtin.systemd:
+        name: "{{ falcon_service_name }}"
+        state: started
+      register: falcon_start_result
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    # ========================================================
+    # CHECK SERVICE
+    # ========================================================
+
+    - name: Check Falcon Sensor service
+      ansible.builtin.systemd:
+        name: "{{ falcon_service_name }}"
+      register: falcon_service_status
+      failed_when: false
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    # ========================================================
+    # FINAL STATUS
+    # ========================================================
+
+    - name: Determine final Falcon status
+      ansible.builtin.set_fact:
+        falcon_status: >-
+          {% if not falcon_install_success %}
+          FALCON_NOT_INSTALLED
+          {% elif not falcon_cid_valid %}
+          FALCON_INSTALLED_BUT_CID_NOT_CONFIGURED
+          {% elif falcon_service_status.status.ActiveState | default('inactive') != 'active' %}
+          FALCON_INSTALLED_BUT_SERVICE_INACTIVE
+          {% else %}
+          FALCON_INSTALLED_AND_ACTIVE
+          {% endif %}
+      when:
+        - falcon_status == "NOT_PROCESSED"
+
+
+    # ========================================================
+    # SENSOR VERSION
+    # ========================================================
+
+    - name: Get Falcon Sensor version
+      ansible.builtin.command:
+        argv:
+          - "{{ falconctl_path }}"
+          - "-g"
+          - "--version"
+      register: falcon_version
+      changed_when: false
+      failed_when: false
+      when:
+        - falcon_status in
+          [
+            "FALCON_INSTALLED_AND_ACTIVE",
+            "FALCON_INSTALLED_BUT_CID_NOT_CONFIGURED",
+            "FALCON_INSTALLED_BUT_SERVICE_INACTIVE"
+          ]
+
+
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
+
+    - name: Display Falcon installation result
+      ansible.builtin.debug:
+        msg:
+          - "====================================================="
+          - "FALCON DEPLOYMENT RESULT"
+          - "====================================================="
+          - "Server         : {{ inventory_hostname }}"
+          - "Hostname       : {{ ansible_facts.hostname }}"
+          - "OS             : {{ ansible_facts.distribution }}"
+          - "OS Version     : {{ ansible_facts.distribution_version }}"
+          - "Architecture   : {{ ansible_facts.architecture }}"
+          - "Status         : {{ falcon_status | trim }}"
+          - "Falconctl      : {{ 'PRESENT' if falcon_install_success | default(false) else 'NOT PRESENT' }}"
+          - "CID Valid      : {{ 'YES' if falcon_cid_valid | default(false) else 'NO' }}"
+          - "Service        : {{ falcon_service_status.status.ActiveState | default('NOT AVAILABLE') }}"
+          - "Sensor Version : {{ falcon_version.stdout | default('N/A') | trim }}"
+          - "====================================================="
+
+
+  # ==========================================================
+  # CLEANUP
+  # ==========================================================
+
+  post_tasks:
+
+    - name: Remove Falcon temporary directory
+      ansible.builtin.file:
+        path: "{{ falcon_work_dir }}"
+        state: absent
+      failed_when: false

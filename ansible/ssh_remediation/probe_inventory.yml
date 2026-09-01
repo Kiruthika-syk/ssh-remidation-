@@ -1,0 +1,56 @@
+---
+# Read-only: probe SSH port 22 for hosts listed in inventory.txt (no vCenter needed)
+- name: Probe SSH reachability for inventory hosts
+  hosts: ssh_unreachable
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: Set shared report file path
+      ansible.builtin.set_fact:
+        report_file: "{{ report_dir }}/probe_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.csv"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Initialize probe report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        content: "Host,IP,SSH Port 22,Status\n"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Probe SSH port 22
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        timeout: "{{ ssh_probe_timeout }}"
+        state: started
+      register: ssh_probe
+      ignore_errors: true
+      delegate_to: localhost
+
+    - name: Record probe result
+      ansible.builtin.lineinfile:
+        path: "{{ report_file }}"
+        insertafter: EOF
+        line: "{{ inventory_hostname }},{{ ansible_host | default(inventory_hostname) }},{{ 'open' if ssh_probe is succeeded else 'closed' }},{{ 'reachable' if ssh_probe is succeeded else 'unreachable' }}"
+      delegate_to: localhost
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ 'REACHABLE — skip remediation' if ssh_probe is succeeded else 'UNREACHABLE — candidate for remediate_ssh.yml' }}"
+
+    - name: Probe summary
+      ansible.builtin.debug:
+        msg: "Probe report: {{ report_file }}"
+      delegate_to: localhost
+      run_once: true

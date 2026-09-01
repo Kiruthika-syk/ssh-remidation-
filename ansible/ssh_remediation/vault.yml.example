@@ -1,0 +1,8 @@
+---
+# Add these keys via: ansible-vault edit vault.yml --vault-password-file ../linux_tanium/vault_password_file
+vcenter_username: "your_vcenter_user@strykercorp.com"
+vcenter_password: "CHANGE_ME"
+
+guest_credentials:
+  username: root
+  password: "CHANGE_ME"

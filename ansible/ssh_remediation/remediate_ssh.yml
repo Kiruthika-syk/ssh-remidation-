@@ -1,0 +1,280 @@
+---
+- name: Remediate SSH on unreachable Linux servers (inventory-gated)
+  hosts: ssh_unreachable
+  gather_facts: false
+  serial: 1
+
+  collections:
+    - community.vmware
+
+  vars_files:
+    - vault.yml
+
+  vars:
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    result_file: "{{ report_dir }}/remediation_{{ timestamp }}.json"
+    result_csv: "{{ report_dir }}/remediation_{{ timestamp }}.csv"
+    ssh_reachable: false
+    remediation_action: "none"
+    final_status: "PENDING"
+
+  pre_tasks:
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Initialize remediation CSV report
+      ansible.builtin.copy:
+        dest: "{{ result_csv }}"
+        content: "Server,vCenter,Initial SSH,Action Taken,Post SSH,Result\n"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate required host variables
+      ansible.builtin.assert:
+        that:
+          - vcenter is defined
+          - vm_name is defined
+        fail_msg: "Host {{ inventory_hostname }} must define vcenter and vm_name in inventory.txt"
+
+    - name: Check if SSH is already reachable (skip if yes)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        timeout: "{{ ssh_probe_timeout }}"
+        state: started
+      register: pre_ssh_check
+      ignore_errors: true
+      delegate_to: localhost
+
+    - name: Mark host as already reachable — skip all changes
+      ansible.builtin.set_fact:
+        ssh_reachable: true
+        remediation_action: "skipped_already_reachable"
+        final_status: "SKIPPED"
+      when: pre_ssh_check is succeeded
+
+    - name: Record skipped host in reports
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        insertafter: EOF
+        line: "{{ item.line }}"
+        create: true
+        mode: "0644"
+      loop:
+        - path: "{{ result_file }}"
+          line: "{{ host_result | to_json }}"
+        - path: "{{ result_csv }}"
+          line: "{{ inventory_hostname }},{{ vcenter }},reachable,skipped,reachable,SKIPPED"
+      vars:
+        host_result:
+          server: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(inventory_hostname) }}"
+          vcenter: "{{ vcenter }}"
+          vm_name: "{{ vm_name }}"
+          initial_ssh: reachable
+          action_taken: skipped_already_reachable
+          post_ssh: reachable
+          result: SKIPPED
+          timestamp: "{{ timestamp }}"
+      delegate_to: localhost
+      when: pre_ssh_check is succeeded
+
+    - name: End host processing if SSH already works
+      ansible.builtin.meta: end_host
+      when: pre_ssh_check is succeeded
+
+  tasks:
+    - name: Backup sshd_config via Guest Operations
+      community.vmware.vmware_vm_shell:
+        hostname: "{{ vcenter }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        vm_id: "{{ vm_name }}"
+        vm_username: "{{ guest_credentials.username }}"
+        vm_password: "{{ guest_credentials.password }}"
+        vm_shell: /bin/bash
+        vm_shell_args: "-c 'cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.{{ timestamp }}'"
+        wait_for_process: true
+        timeout: 120
+      delegate_to: localhost
+      register: guest_backup
+      no_log: true
+      ignore_errors: true
+      tags:
+        - guest_ops
+        - never
+
+    - name: Check port 22 locally inside guest
+      community.vmware.vmware_vm_shell:
+        hostname: "{{ vcenter }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        vm_id: "{{ vm_name }}"
+        vm_username: "{{ guest_credentials.username }}"
+        vm_password: "{{ guest_credentials.password }}"
+        vm_shell: /bin/bash
+        vm_shell_args: "-c 'ss -tlnp 2>/dev/null | grep \":22\" || netstat -tlnp 2>/dev/null | grep \":22\" || echo PORT22_NOT_LISTENING'"
+        wait_for_process: true
+        timeout: 120
+      delegate_to: localhost
+      register: guest_port_check
+      no_log: true
+      ignore_errors: true
+      check_mode: false
+      tags:
+        - guest_ops
+
+    - name: Apply sshd_config settings via Guest Operations
+      community.vmware.vmware_vm_shell:
+        hostname: "{{ vcenter }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        vm_id: "{{ vm_name }}"
+        vm_username: "{{ guest_credentials.username }}"
+        vm_password: "{{ guest_credentials.password }}"
+        vm_shell: /bin/bash
+        vm_shell_args: >-
+          -c 'for kv in "Port 22" "PubkeyAuthentication yes" "PasswordAuthentication yes"; do
+          key="${kv%% *}"; val="${kv#* }";
+          if grep -qE "^#?[[:space:]]*${key}[[:space:]]" /etc/ssh/sshd_config; then
+            sed -i "s/^[#[:space:]]*${key}[[:space:]].*/${key} ${val}/" /etc/ssh/sshd_config;
+          else
+            echo "${key} ${val}" >> /etc/ssh/sshd_config;
+          fi; done'
+        wait_for_process: true
+        timeout: 120
+      delegate_to: localhost
+      register: guest_config
+      no_log: true
+      ignore_errors: true
+      when: guest_port_check is succeeded or guest_port_check is failed
+      check_mode: false
+      tags:
+        - guest_ops
+
+    - name: Validate sshd configuration inside guest
+      community.vmware.vmware_vm_shell:
+        hostname: "{{ vcenter }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        vm_id: "{{ vm_name }}"
+        vm_username: "{{ guest_credentials.username }}"
+        vm_password: "{{ guest_credentials.password }}"
+        vm_shell: /bin/bash
+        vm_shell_args: "-c '/usr/sbin/sshd -t 2>&1'"
+        wait_for_process: true
+        timeout: 120
+      delegate_to: localhost
+      register: guest_validate
+      no_log: true
+      ignore_errors: true
+      when: guest_config is succeeded
+      check_mode: false
+      tags:
+        - guest_ops
+
+    - name: Restart SSH service inside guest
+      community.vmware.vmware_vm_shell:
+        hostname: "{{ vcenter }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        vm_id: "{{ vm_name }}"
+        vm_username: "{{ guest_credentials.username }}"
+        vm_password: "{{ guest_credentials.password }}"
+        vm_shell: /bin/bash
+        vm_shell_args: "-c 'systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; sleep 2; ss -tlnp 2>/dev/null | grep \":22\" || netstat -tlnp 2>/dev/null | grep \":22\"'"
+        wait_for_process: true
+        timeout: 180
+      delegate_to: localhost
+      register: guest_restart
+      no_log: true
+      ignore_errors: true
+      when: guest_validate is succeeded
+      check_mode: false
+      tags:
+        - guest_ops
+
+    - name: Set remediation result after guest ops
+      ansible.builtin.set_fact:
+        remediation_action: "{{ 'guest_ops_remediated' if guest_restart is succeeded else 'manual_console_required' }}"
+        final_status: "{{ 'SUCCESS' if guest_restart is succeeded else 'PENDING' }}"
+      when: guest_config is defined
+
+    - name: Guest ops failed — manual console required
+      ansible.builtin.set_fact:
+        remediation_action: "manual_console_required"
+        final_status: "PENDING"
+      when: guest_config is failed or guest_config is skipped
+
+    - name: Re-test SSH connectivity from control node
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: 22
+        timeout: "{{ ssh_probe_timeout }}"
+        state: started
+      register: post_ssh_check
+      ignore_errors: true
+      delegate_to: localhost
+      when: remediation_action == 'guest_ops_remediated'
+
+    - name: Update final status after post-check
+      ansible.builtin.set_fact:
+        ssh_reachable: "{{ post_ssh_check is succeeded }}"
+        final_status: "{{ 'SUCCESS' if post_ssh_check is succeeded else 'PARTIAL' }}"
+      when: post_ssh_check is defined and not post_ssh_check.skipped | default(false)
+
+    - name: Append per-host result to JSON and CSV reports
+      ansible.builtin.lineinfile:
+        path: "{{ item.path }}"
+        create: true
+        insertafter: EOF
+        line: "{{ item.line }}"
+        mode: "0644"
+      loop:
+        - path: "{{ result_file }}"
+          line: "{{ host_result | to_json }}"
+        - path: "{{ result_csv }}"
+          line: "{{ inventory_hostname }},{{ vcenter }},unreachable,{{ remediation_action }},{{ 'reachable' if ssh_reachable else 'unreachable' }},{{ final_status }}"
+      vars:
+        host_result:
+          server: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host | default(inventory_hostname) }}"
+          vcenter: "{{ vcenter }}"
+          vm_name: "{{ vm_name }}"
+          initial_ssh: unreachable
+          action_taken: "{{ remediation_action }}"
+          post_ssh: "{{ 'reachable' if ssh_reachable else 'unreachable' }}"
+          result: "{{ final_status }}"
+          timestamp: "{{ timestamp }}"
+      delegate_to: localhost
+
+    - name: Display per-host summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} | vCenter={{ vcenter }} | action={{ remediation_action }}
+          | post_ssh={{ 'reachable' if ssh_reachable else 'unreachable' }} | result={{ final_status }}
+
+  post_tasks:
+    - name: Display manual console steps when guest ops failed
+      ansible.builtin.debug:
+        msg:
+          - "MANUAL CONSOLE REQUIRED for {{ inventory_hostname }} ({{ vm_name }})"
+          - "1. Open https://{{ vcenter }}/ui/app and launch VM console"
+          - "2. Login as root/admin"
+          - "3. Check: ss -tlnp | grep ':22'"
+          - "4. Edit /etc/ssh/sshd_config — ensure Port 22, PubkeyAuthentication yes, PasswordAuthentication yes"
+          - "5. Validate: /usr/sbin/sshd -t"
+          - "6. Restart: systemctl restart sshd || systemctl restart ssh"
+          - "7. Verify port 22 and re-test SSH"
+      when: remediation_action == 'manual_console_required'

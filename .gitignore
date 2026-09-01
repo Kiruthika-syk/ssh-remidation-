@@ -1,0 +1,18 @@
+# Secrets — keep local only
+ansible/falcon_token.ini
+ansible/ssh_remediation/vault.yml
+ansible/vault.yml
+**/vault_password_file
+
+# Runtime artifacts
+ansible/ssh_remediation/reports/
+ansible/falcon_token_run*.log
+*.log
+
+# Data files
+*.xlsx
+ansible/ssh_remediation/inventory.draft.txt
+
+# Python
+__pycache__/
+*.pyc

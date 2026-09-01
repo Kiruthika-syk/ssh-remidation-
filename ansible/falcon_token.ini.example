@@ -1,0 +1,38 @@
+[all:vars]
+
+# ------------------------------------------------------------
+# Falcon package repository (sensor RPMs on execution host)
+# ------------------------------------------------------------
+source_server=YOUR_EXECUTION_HOST_IP
+source_user=YOUR_USER
+source_path=/path/to/crowdstrike/rpms
+
+# ------------------------------------------------------------
+# Target server SSH credentials
+# Copy to falcon_token.ini and fill in before running
+# ------------------------------------------------------------
+ansible_user=root
+ansible_password=CHANGEME
+
+# ------------------------------------------------------------
+# Ansible SSH settings
+# ------------------------------------------------------------
+ansible_connection=ssh
+ansible_shell_type=sh
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+# ------------------------------------------------------------
+# Privilege escalation
+# ------------------------------------------------------------
+ansible_become=true
+ansible_become_method=sudo
+ansible_become_user=root
+ansible_become_password="{{ ansible_password }}"
+
+# ============================================================
+# Target hosts — one IP per line under [linux]
+# ============================================================
+
+[linux]
+# 10.0.0.1
+# 10.0.0.2

@@ -1,0 +1,10 @@
+reports/
+*.csv
+*.json
+vault.yml
+__pycache__/
+*.pyc
+MissingCrowdStrike.xlsx
+MissingCrowdStrike40.xlsx
+*.xlsx
+inventory.draft.txt

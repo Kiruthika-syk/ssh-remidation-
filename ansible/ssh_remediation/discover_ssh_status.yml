@@ -1,0 +1,172 @@
+---
+- name: Discover Linux VM SSH status from vCenters (read-only)
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  collections:
+    - community.vmware
+
+  vars_files:
+    - vault.yml
+
+  vars:
+    timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    report_file: "{{ report_dir }}/ssh_status_{{ timestamp }}.csv"
+    csv_header: "vCenter,VM Name,IP Address,Guest OS,Power State,VMware Tools,SSH Port 22,SSH Reachable,In Inventory,Recommended Action"
+    inventory_hosts: "{{ groups['ssh_unreachable'] | default([]) }}"
+    inventory_ips: "{{ hostvars | dict2items | selectattr('key', 'in', groups['ssh_unreachable'] | default([])) | map(attribute='value.ansible_host') | select('defined') | list }}"
+
+  pre_tasks:
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Initialize CSV report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        content: "{{ csv_header }}\n"
+        mode: "0644"
+
+  tasks:
+    - name: Test vCenter connectivity
+      community.vmware.vmware_vm_info:
+        hostname: "{{ item }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+      loop: "{{ vcenters }}"
+      register: vcenter_connect_test
+      no_log: true
+      failed_when: false
+      tags:
+        - vcenter_connect
+        - always
+
+    - name: Report vCenter connectivity
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ 'OK' if item.virtual_machines is defined else 'FAILED - ' ~ (item.msg | default('unknown error')) }}"
+      loop: "{{ vcenter_connect_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags:
+        - vcenter_connect
+        - always
+
+    - name: Collect VM inventory from vCenters
+      community.vmware.vmware_vm_info:
+        hostname: "{{ item }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+      loop: "{{ vcenters }}"
+      register: vcenter_results
+      no_log: true
+      failed_when: false
+      tags:
+        - discover
+
+    - name: Build flattened VM list with vCenter tag
+      ansible.builtin.set_fact:
+        all_vms: "{{ all_vms | default([]) + vm_batch }}"
+      vars:
+        vm_batch: >-
+          {{
+            (item.virtual_machines | default([]))
+            | map('combine', {'vcenter': item.item})
+            | list
+          }}
+      loop: "{{ vcenter_results.results }}"
+      when: item.virtual_machines is defined
+      tags:
+        - discover
+
+    - name: Filter powered-on Linux VMs (exclude Windows)
+      ansible.builtin.set_fact:
+        linux_vms: >-
+          {{
+            all_vms | default([])
+            | selectattr('power_state', 'equalto', 'poweredOn')
+            | rejectattr('guest_fullname', 'search', '(?i)windows')
+            | rejectattr('guest_fullname', 'search', '(?i)microsoft')
+            | list
+          }}
+      tags:
+        - discover
+
+    - name: Further filter to known Linux guest OS families
+      ansible.builtin.set_fact:
+        linux_vms: "{{ linux_vms | filter_linux_vms(linux_guest_patterns) | list }}"
+      tags:
+        - discover
+
+    - name: Probe SSH port 22 for each Linux VM
+      ansible.builtin.wait_for:
+        host: "{{ probe_host }}"
+        port: 22
+        timeout: "{{ ssh_probe_timeout }}"
+        state: started
+      register: ssh_port_probe
+      ignore_errors: true
+      vars:
+        probe_host: "{{ item.ip_address | default('') }}"
+      loop: "{{ linux_vms | default([]) }}"
+      when:
+        - item.ip_address is defined
+        - item.ip_address | length > 0
+        - item.ip_address != 'N/A'
+      loop_control:
+        label: "{{ item.guest_name | default('unknown') }} ({{ item.ip_address | default('no-ip') }})"
+      tags:
+        - discover
+        - ssh_probe
+
+    - name: Write discovery results to CSV
+      ansible.builtin.lineinfile:
+        path: "{{ report_file }}"
+        insertafter: EOF
+        line: "{{ csv_line }}"
+      vars:
+        probe_result: "{{ (ssh_port_probe.results | default([]) | selectattr('item.guest_name', 'equalto', item.guest_name) | list | first) | default({}) }}"
+        port_open: >-
+          {{
+            'no_ip' if not (item.ip_address | default('') | length > 0)
+            else ('open' if not (probe_result.failed | default(true)) else 'closed')
+          }}
+        ssh_reachable: >-
+          {{
+            'no_ip' if not (item.ip_address | default('') | length > 0)
+            else ('reachable' if not (probe_result.failed | default(true)) else 'unreachable')
+          }}
+        tools_status: "{{ item.guest_tools_status | default('unknown') }}"
+        in_inventory: >-
+          {{
+            'yes' if (
+              (item.guest_name | default('') in inventory_hosts)
+              or (item.ip_address | default('') in inventory_ips)
+              or (item.guest_name | default('') in inventory_ips)
+            ) else 'no'
+          }}
+        recommended: >-
+          {{
+            'skip' if not (probe_result.failed | default(true))
+            else ('remediate_via_guest_ops' if (item.guest_tools_status | default('') | lower == 'guesttoolsrunning') else 'manual_console')
+          }}
+        csv_line: >-
+          {{ item.vcenter }},{{ item.guest_name | default('N/A') }},{{ item.ip_address | default('N/A') }},{{ item.guest_fullname | default('Unknown') }},{{ item.power_state | default('unknown') }},{{ tools_status }},{{ port_open }},{{ ssh_reachable }},{{ in_inventory }},{{ recommended }}
+      loop: "{{ linux_vms | default([]) }}"
+      loop_control:
+        label: "{{ item.guest_name | default('unknown') }}"
+      tags:
+        - discover
+
+    - name: Display report summary
+      ansible.builtin.debug:
+        msg:
+          - "Discovery complete. Report: {{ report_file }}"
+          - "Total Linux VMs evaluated: {{ linux_vms | default([]) | length }}"
+          - "Review the CSV and add approved unreachable hosts to inventory.txt before running remediate_ssh.yml"
+      tags:
+        - always
